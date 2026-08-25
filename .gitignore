@@ -46,3 +46,9 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Gradle build cache — локальный дисковый кэш, не исходники
+.gradle/
+
+# Рабочая директория Claude Code (сессионные файлы, не относится к проекту)
+.claude/
