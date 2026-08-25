@@ -1,0 +1,31 @@
+workflows:
+  ios-unsigned:
+    name: iOS unsigned build (без Apple Developer Program)
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      # --no-codesign — без Apple Developer Program, без сертификатов и
+      # provisioning profile. Собирает .app без подписи Apple; подписывать
+      # для установки на конкретный iPhone будем локально через Sideloadly
+      # с бесплатным Apple ID.
+      - name: Build unsigned iOS app
+        script: |
+          flutter build ios --release --no-codesign
+
+      # flutter build ios --no-codesign даёт только .app, а не .ipa.
+      # Sideloadly ждёт именно .ipa (по сути тот же .app, упакованный в zip
+      # со структурой Payload/), поэтому пакуем вручную.
+      - name: Package unsigned .ipa
+        script: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -r Runner.app Payload/
+          zip -r ../../../unsigned.ipa Payload
+    artifacts:
+      - unsigned.ipa
+      - build/ios/iphoneos/*.app
