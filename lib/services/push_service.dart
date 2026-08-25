@@ -75,7 +75,9 @@ class PushService {
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
         ?.createNotificationChannel(channel);
 
-    await FirebaseMessaging.instance.requestPermission();
+    try {
+      await FirebaseMessaging.instance.requestPermission().timeout(const Duration(seconds: 5));
+    } catch (_) {}
 
     FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
@@ -88,10 +90,12 @@ class PushService {
       _setPendingPushFromPayload(launchPayload);
     }
 
-    final token = await FirebaseMessaging.instance.getToken();
-    if (token != null) {
-      unawaited(_sendTokenToServer(token));
-    }
+    try {
+      final token = await FirebaseMessaging.instance.getToken().timeout(const Duration(seconds: 5));
+      if (token != null) {
+        unawaited(_sendTokenToServer(token));
+      }
+    } catch (_) {}
     FirebaseMessaging.instance.onTokenRefresh.listen(_sendTokenToServer);
   }
 

@@ -9,8 +9,12 @@ final navigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await AnalyticsService.init();
-  await PushService.init();
+  try {
+    await AnalyticsService.init();
+  } catch (_) {}
+  try {
+    await PushService.init();
+  } catch (_) {}
   runApp(const LombardApp());
 }
 
