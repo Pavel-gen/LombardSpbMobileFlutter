@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "1012323754832",
+    "project_id": "lombardspb-a2919",
+    "storage_bucket": "lombardspb-a2919.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1012323754832:android:8226d32298dbef9543c255",
+        "android_client_info": {
+          "package_name": "best.app.lombardspb"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD5C682_gRPMjqNzr-N_BUvki1BJ6LSp94"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1012323754832:android:2af8b4bec5cd874543c255",
+        "android_client_info": {
+          "package_name": "com.example.lombardspb"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD5C682_gRPMjqNzr-N_BUvki1BJ6LSp94"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
