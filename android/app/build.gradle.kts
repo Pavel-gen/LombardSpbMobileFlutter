@@ -63,13 +63,12 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
-            // Минификация ВЫКЛЮЧЕНА для первого релиза переписанного приложения:
-            // R8 на большой поверхности Flutter-плагинов — отдельный класс рисков
-            // («в debug пуш работает, в release нет»). Включить в 2.0.1 после
-            // проверки стабильности: isMinifyEnabled = true + isShrinkResources = true
-            // + проверить proguard-rules.pro (заготовка уже в репозитории).
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // R8/минификация включена → AGP кладёт mapping.txt в бандл (Play
+            // сам его подхватывает — деобфускация крэшей). Keep-правила для
+            // плагинов — в proguard-rules.pro. ОБЯЗАТЕЛЬНО проверить release-
+            // сборку на устройстве: холодный старт + пуш на убитом приложении.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
