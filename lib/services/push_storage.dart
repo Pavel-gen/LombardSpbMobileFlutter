@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/push_item.dart';
+import 'push_logic.dart';
 
 /// История push-уведомлений в SharedPreferences.
 /// Аналог PushStorage.kt из Android-версии — тот же формат JSON-массива,
@@ -15,11 +16,22 @@ class PushStorage {
   static Future<SharedPreferences> _prefs() =>
       SharedPreferences.getInstance();
 
+  /// Добавляет пуш в историю. Если `msgId` уже есть в истории — НЕ дублирует
+  /// (один пуш может прийти и FCM-ом, и из серверного ящика). `timestampMs` —
+  /// время события (для inbox — created_at с сервера), по умолчанию сейчас.
+  /// Возвращает id новой записи, либо '' если это дубль.
   static Future<String> addPush({
     required String title,
     required String body,
     required String link,
+    String msgId = '',
+    int? timestampMs,
   }) async {
+    final list = await getAll();
+    if (pushListContainsMsgId(list, msgId)) {
+      return '';
+    }
+
     final id =
         '${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(1000000)}';
     final item = PushItem(
@@ -27,16 +39,12 @@ class PushStorage {
       title: title,
       body: body,
       link: link,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
+      timestamp: timestampMs ?? DateTime.now().millisecondsSinceEpoch,
       read: false,
+      msgId: msgId,
     );
 
-    final list = await getAll();
-    list.insert(0, item);
-    while (list.length > _maxItems) {
-      list.removeLast();
-    }
-    await _saveAll(list);
+    await _saveAll(pushListInsertSorted(list, item, _maxItems));
     return id;
   }
 

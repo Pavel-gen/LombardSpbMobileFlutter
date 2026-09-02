@@ -6,6 +6,10 @@ class PushItem {
   final int timestamp;
   final bool read;
 
+  /// msg_id из data-payload пуша / из серверного ящика (inbox). Пустой у старых
+  /// записей. По нему дедуп: один пуш не двоится, придя и push-ом, и из inbox.
+  final String msgId;
+
   const PushItem({
     required this.id,
     required this.title,
@@ -13,6 +17,7 @@ class PushItem {
     required this.link,
     required this.timestamp,
     required this.read,
+    this.msgId = '',
   });
 
   PushItem copyWith({bool? read}) {
@@ -23,6 +28,7 @@ class PushItem {
       link: link,
       timestamp: timestamp,
       read: read ?? this.read,
+      msgId: msgId,
     );
   }
 
@@ -33,6 +39,7 @@ class PushItem {
     'link': link,
     'timestamp': timestamp,
     'read': read,
+    if (msgId.isNotEmpty) 'msg_id': msgId,
   };
 
   factory PushItem.fromJson(Map<String, dynamic> json) => PushItem(
@@ -42,5 +49,6 @@ class PushItem {
     link: json['link'] as String? ?? '',
     timestamp: json['timestamp'] as int? ?? 0,
     read: json['read'] as bool? ?? false,
+    msgId: json['msg_id'] as String? ?? '',
   );
 }

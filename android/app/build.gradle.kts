@@ -1,8 +1,20 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     id("com.google.gms.google-services")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Реквизиты подписи релиза — в android/key.properties (в .gitignore, в репозиторий
+// не попадает). Если файла нет (CI без секретов, чужая машина) — релиз соберётся
+// debug-ключом, как раньше, чтобы `flutter run --release` не падал.
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
 android {
@@ -31,11 +43,37 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        create("release") {
+            val alias = keystoreProperties.getProperty("keyAlias")
+            if (alias != null) {
+                keyAlias = alias
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
+                storePassword = keystoreProperties.getProperty("storePassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Подпись upload-ключом, если есть key.properties; иначе debug (см. выше).
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+            // Минификация ВЫКЛЮЧЕНА для первого релиза переписанного приложения:
+            // R8 на большой поверхности Flutter-плагинов — отдельный класс рисков
+            // («в debug пуш работает, в release нет»). Включить в 2.0.1 после
+            // проверки стабильности: isMinifyEnabled = true + isShrinkResources = true
+            // + проверить proguard-rules.pro (заготовка уже в репозитории).
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }

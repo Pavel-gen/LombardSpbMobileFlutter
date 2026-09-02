@@ -33,6 +33,10 @@ class AnalyticsService {
   /// событием "screen_open" с атрибутом screen — так в кабинете AppMetrica
   /// будет видно, какой конкретно экран открыли.
   static void reportScreen(String name) {
-    AppMetrica.reportEventWithMap('screen_open', {'screen': name});
+    // Аналитика не должна ронять экран, если плагин недоступен (тесты на хосте,
+    // сбой канала) — глотаем любую ошибку.
+    try {
+      AppMetrica.reportEventWithMap('screen_open', {'screen': name});
+    } catch (_) {}
   }
 }

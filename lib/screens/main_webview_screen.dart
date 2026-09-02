@@ -8,11 +8,16 @@ import 'package:webview_flutter/webview_flutter.dart';
 import '../services/analytics_service.dart';
 import '../services/push_service.dart';
 import '../services/push_storage.dart';
+import '../widgets/linkified_text.dart';
 import 'phone_verification_screen.dart';
 
 /// Полноэкранный WebView сайта lombard.center — аналог MainActivity.kt.
 class MainWebViewScreen extends StatefulWidget {
-  const MainWebViewScreen({super.key});
+  const MainWebViewScreen({super.key, this.initialUrl});
+
+  /// Стартовый адрес. null → главная lombard.center (кнопка «Наши услуги»).
+  /// Задаётся, например, кнопкой «Личный кабинет».
+  final String? initialUrl;
 
   /// true, пока этот экран смонтирован — по нему main.dart решает, нужно ли
   /// открывать новый экран поверх текущего при тапе по уведомлению, или он
@@ -98,7 +103,7 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
           },
         ),
       )
-      ..loadRequest(Uri.parse(_homeUrl));
+      ..loadRequest(Uri.parse(widget.initialUrl ?? _homeUrl));
 
     _beginPageLoad();
     _refreshBadge();
@@ -140,7 +145,9 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(push.title),
-        content: SingleChildScrollView(child: Text(push.body)),
+        // Ссылки в тексте пуша — кликабельные (внешний браузер), а кнопка
+        // «Понятно» ниже открывает основную ссылку пуша уже в этом WebView.
+        content: SingleChildScrollView(child: LinkifiedText(push.body)),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),

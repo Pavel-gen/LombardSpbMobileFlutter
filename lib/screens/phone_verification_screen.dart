@@ -9,9 +9,12 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/push_item.dart';
 import '../services/analytics_service.dart';
+import '../services/app_log.dart';
+import '../services/push_service.dart';
 import '../services/push_storage.dart';
 import '../utils/device_id.dart';
 import '../utils/phone_mask_formatter.dart';
+import '../widgets/linkified_text.dart';
 
 /// Привязка номера телефона (push-уведомления) + история пушей.
 /// Аналог PhoneVerificationActivity.kt + SmsCodeRetriever.kt (SMS User Consent API).
@@ -31,6 +34,7 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
   bool _showCodeStep = false;
   bool _isVerified = false;
   bool _busy = false;
+  bool _loading = true; // первичная загрузка локального состояния
   String _statusText = '';
 
   String _currentKod = '';
@@ -78,12 +82,33 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
-    final verified = prefs.getBool('phone_verified') ?? false;
-    final history = await PushStorage.getAll();
+    final verifiedLocal = prefs.getBool('phone_verified') ?? false;
+
+    // ШАГ 1. Сразу показываем последнее известное состояние из локальной
+    // памяти — без ожидания сети, чтобы экран не мигал «форма ввода → ✅».
+    final history0 = await PushStorage.getAll();
     if (!mounted) return;
     setState(() {
-      _isVerified = verified;
-      _history = history;
+      _isVerified = verifiedLocal;
+      _history = history0;
+      _loading = false;
+    });
+
+    // ШАГ 2. Тихая синхронизация с сервером в фоне. Если локально «не
+    // привязан» — спросим сервер (источник истины): флаг мог потеряться
+    // из-за очистки префов на MIUI / переустановки. Плюс подтянем из
+    // серверного ящика пропущенные уведомления.
+    if (!verifiedLocal) {
+      await PushService.reconcileBindState();
+    }
+    await PushService.syncInbox();
+
+    final verifiedAfter = prefs.getBool('phone_verified') ?? false;
+    final history1 = await PushStorage.getAll();
+    if (!mounted) return;
+    setState(() {
+      _isVerified = verifiedAfter;
+      _history = history1;
     });
   }
 
@@ -197,8 +222,10 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
         await prefs.setBool('phone_verified', true);
         await prefs.setString('verified_user_id', _currentUserId);
         await prefs.setString('verified_phone', _currentPhone);
+        AppLog.event('verify_ok', {'user': _currentUserId});
         if (mounted) Navigator.of(context).pop(true);
       } else {
+        AppLog.event('verify_fail', {'msg': json['message']});
         setState(() {
           _statusText = json['message'] as String? ?? 'Ошибка сервера';
           _busy = false;
@@ -244,6 +271,7 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
     final userId = prefs.getString('verified_user_id') ?? '';
 
     if (userId.isEmpty) {
+      await PushService.unregisterToken();
       await _clearVerificationLocally();
       return;
     }
@@ -261,6 +289,10 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
       );
       final json = jsonDecode(response.body) as Map<String, dynamic>;
       if (json['success'] == true) {
+        // Удаляем FCM-токен на устройстве и просим сервер снять получение
+        // пушей (по этому же device_uuid/user_id) — чтобы токен не оставался
+        // «живым» получателем после отключения.
+        await PushService.unregisterToken();
         await _clearVerificationLocally();
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -312,7 +344,10 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(item.title),
-        content: SingleChildScrollView(child: Text(item.body)),
+        // Ссылки внутри текста пуша — кликабельные, открываются во внешнем
+        // браузере. Аналог formatTextWithClickableLinks() + LinkMovementMethod
+        // из PhoneVerificationActivity.kt.
+        content: SingleChildScrollView(child: LinkifiedText(item.body)),
         actions: [
           if (item.link.startsWith('http'))
             TextButton(
@@ -334,9 +369,22 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    // Подписи над полями и статус-строка — цвет из темы, чтобы не сливались
+    // с тёмным фоном (раньше был жёстко зашит Colors.black54).
+    final labelStyle = TextStyle(
+      fontSize: 14,
+      fontWeight: FontWeight.w600,
+      color: cs.onSurface,
+    );
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Подключение персональных уведомлений')),
-      body: SafeArea(
+      appBar: AppBar(
+        title: const Text('Уведомления', overflow: TextOverflow.ellipsis),
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Column(
@@ -345,14 +393,17 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
               if (_statusText.isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 16),
-                  child: Text(_statusText, style: const TextStyle(color: Colors.black54)),
+                  child: Text(
+                    _statusText,
+                    style: TextStyle(color: cs.onSurfaceVariant),
+                  ),
                 ),
               if (_isVerified) ...[
-                const Padding(
-                  padding: EdgeInsets.only(bottom: 24),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 24),
                   child: Text(
                     '✅ Вы уже подключили персональные уведомления',
-                    style: TextStyle(fontSize: 16),
+                    style: TextStyle(fontSize: 16, color: cs.onSurface),
                   ),
                 ),
                 SizedBox(
@@ -363,10 +414,11 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
                   ),
                 ),
               ] else if (!_showCodeStep) ...[
-                const Text('Введите номер телефона:'),
+                Text('Введите номер телефона:', style: labelStyle),
                 TextField(
                   controller: _phoneController,
                   keyboardType: TextInputType.phone,
+                  autofillHints: const [AutofillHints.telephoneNumber],
                   inputFormatters: [PhoneMaskFormatter()],
                   decoration: const InputDecoration(hintText: '+7 (999) 123-45-67'),
                 ),
@@ -383,7 +435,7 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
                   child: const Text('Пропустить', style: TextStyle(color: Colors.grey)),
                 ),
               ] else ...[
-                const Text('Введите код из СМС:'),
+                Text('Введите код из СМС:', style: labelStyle),
                 TextField(
                   controller: _codeController,
                   keyboardType: TextInputType.number,
@@ -405,9 +457,9 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
                   child: const Text('Пропустить', style: TextStyle(color: Colors.grey)),
                 ),
               ],
-              const Padding(
-                padding: EdgeInsets.only(top: 16, bottom: 8),
-                child: Text('История уведомлений:', style: TextStyle(fontSize: 15)),
+              Padding(
+                padding: const EdgeInsets.only(top: 16, bottom: 8),
+                child: Text('История уведомлений:', style: labelStyle),
               ),
               _historyList(),
             ],
@@ -431,26 +483,65 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
         shrinkWrap: true,
         itemCount: _history.length,
         separatorBuilder: (_, __) => const Divider(height: 1),
-        itemBuilder: (context, index) {
-          final item = _history[index];
-          return ListTile(
-            onTap: () => _openPush(item),
-            leading: Icon(
-              item.read ? Icons.circle_outlined : Icons.circle,
-              size: 12,
-              color: item.read ? Colors.grey.shade300 : const Color(0xFFE53935),
+        itemBuilder: (context, index) => _historyTile(_history[index]),
+      ),
+    );
+  }
+
+  /// Строка истории. Дата/время — ПОД текстом, а не в trailing: длинный
+  /// заголовок теперь переносится максимум на 2 строки с многоточием и не
+  /// расталкивает вёрстку (как это делала колонка в buildPushRow() Kotlin-версии).
+  Widget _historyTile(PushItem item) {
+    return InkWell(
+      onTap: () => _openPush(item),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 4, right: 12),
+              child: Icon(
+                item.read ? Icons.circle_outlined : Icons.circle,
+                size: 12,
+                color: item.read ? Colors.grey.shade300 : const Color(0xFFE53935),
+              ),
             ),
-            title: Text(
-              item.title,
-              style: TextStyle(fontWeight: item.read ? FontWeight.normal : FontWeight.bold),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: item.read ? FontWeight.normal : FontWeight.bold,
+                    ),
+                  ),
+                  if (item.body.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        item.body,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
+                      ),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      _formatTimestamp(item.timestamp),
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                  ),
+                ],
+              ),
             ),
-            subtitle: Text(item.body, maxLines: 1, overflow: TextOverflow.ellipsis),
-            trailing: Text(
-              _formatTimestamp(item.timestamp),
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          );
-        },
+          ],
+        ),
       ),
     );
   }

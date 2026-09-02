@@ -1,21 +1,88 @@
+import 'dart:async';
+import 'dart:ui';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:workmanager/workmanager.dart';
 
 import 'screens/landing_screen.dart';
 import 'screens/main_webview_screen.dart';
 import 'services/analytics_service.dart';
+import 'services/app_log.dart';
 import 'services/push_service.dart';
 
 final navigatorKey = GlobalKey<NavigatorState>();
 
+const _bgTokenTask = 'fcmTokenRefresh';
+
+/// Точка входа фоновых задач WorkManager. top-level + vm:entry-point —
+/// иначе tree-shaking выкинет её из release-сборки.
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    await PushService.runBackgroundTokenSync();
+    return true;
+  });
+}
+
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  try {
-    await AnalyticsService.init();
-  } catch (_) {}
-  try {
-    await PushService.init();
-  } catch (_) {}
-  runApp(const LombardApp());
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+
+    await AppLog.init();
+
+    // Все необработанные ошибки Flutter и платформы — в журнал (и на сервер).
+    final prevOnError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      unawaited(AppLog.event('flutter_error', {
+        'msg': details.exceptionAsString(),
+        'lib': details.library,
+        'stack': details.stack?.toString().split('\n').take(6).join(' | '),
+      }));
+      prevOnError?.call(details);
+    };
+    PlatformDispatcher.instance.onError = (error, stack) {
+      unawaited(AppLog.event('platform_error', {
+        'msg': error.toString(),
+        'stack': stack.toString().split('\n').take(6).join(' | '),
+      }));
+      return true;
+    };
+
+    try {
+      await AnalyticsService.init();
+    } catch (e) {
+      unawaited(AppLog.event('analytics_init_fail', {'err': '$e'}));
+    }
+    try {
+      await PushService.init();
+    } catch (e) {
+      unawaited(AppLog.event('push_init_fail', {'err': '$e'}));
+    }
+    try {
+      await Workmanager().initialize(callbackDispatcher);
+      // Раз в сутки, даже если приложение не открывают: проверить токен и
+      // переотправить свежий на сервер. Не выполняется только если приложение
+      // именно force-stop / OEM заморозил.
+      await Workmanager().registerPeriodicTask(
+        'fcmTokenRefresh',
+        _bgTokenTask,
+        frequency: const Duration(hours: 24),
+        initialDelay: const Duration(minutes: 15),
+        constraints: Constraints(networkType: NetworkType.connected),
+        existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+        backoffPolicy: BackoffPolicy.linear,
+      );
+    } catch (e) {
+      unawaited(AppLog.event('workmanager_init_fail', {'err': '$e'}));
+    }
+    runApp(const LombardApp());
+  }, (error, stack) {
+    unawaited(AppLog.event('zone_error', {
+      'msg': error.toString(),
+      'stack': stack.toString().split('\n').take(6).join(' | '),
+    }));
+  });
 }
 
 class LombardApp extends StatefulWidget {
@@ -25,17 +92,34 @@ class LombardApp extends StatefulWidget {
   State<LombardApp> createState() => _LombardAppState();
 }
 
-class _LombardAppState extends State<LombardApp> {
+class _LombardAppState extends State<LombardApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     PushService.pendingPush.addListener(_onPendingPush);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     PushService.pendingPush.removeListener(_onPendingPush);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(AppLog.event('lifecycle_resumed'));
+      // Если FCM-токен так и не сгенерировался — при каждом возврате на
+      // передний план запускаем ещё один цикл попыток.
+      PushService.retryTokenIfMissing();
+      // Подтянуть из серверного ящика всё, что не дошло пушем.
+      unawaited(PushService.syncInbox());
+    } else if (state == AppLifecycleState.paused) {
+      unawaited(AppLog.event('lifecycle_paused'));
+      unawaited(AppLog.flush(force: true)); // уходим в фон — выгружаем журнал
+    }
   }
 
   /// Тап по push-уведомлению — как запуск MainActivity через PendingIntent в оригинале.

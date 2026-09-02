@@ -56,13 +56,20 @@ class _LandingScreenState extends State<LandingScreen> with WidgetsBindingObserv
     });
   }
 
-  Future<void> _openContent() async {
+  /// Личный кабинет — онлайн-погашение займа.
+  static const _cabinetUrl = 'https://lombard.center/onlajn-pogashenie/';
+
+  Future<void> _openContent() => _openWeb(null);
+
+  Future<void> _openCabinet() => _openWeb(_cabinetUrl);
+
+  Future<void> _openWeb(String? url) async {
     final results = await Connectivity().checkConnectivity();
     final online = !results.contains(ConnectivityResult.none);
     if (online) {
       if (!mounted) return;
       await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const MainWebViewScreen()),
+        MaterialPageRoute(builder: (_) => MainWebViewScreen(initialUrl: url)),
       );
       _refresh();
     } else {
@@ -108,12 +115,16 @@ class _LandingScreenState extends State<LandingScreen> with WidgetsBindingObserv
                   textAlign: TextAlign.center,
                 ),
               ),
-              if (_online)
+              if (_online) ...[
                 Padding(
                   padding: const EdgeInsets.only(bottom: 12),
                   child: _actionButton('Наши услуги', _openContent),
-                )
-              else
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _actionButton('Личный кабинет', _openCabinet),
+                ),
+              ] else
                 const Padding(
                   padding: EdgeInsets.only(bottom: 16),
                   child: Text(
