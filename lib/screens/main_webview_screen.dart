@@ -32,6 +32,20 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
   static const _pageLoadTimeout = Duration(seconds: 15);
   static const _homeUrl = 'https://lombard.center/';
 
+  /// https-хосты, которые ОБЯЗАНЫ открываться нативным приложением (СБП, банки),
+  /// а не рендериться в WebView — иначе оплата «зависает»/«невозможна».
+  /// `qr.nspk.ru` — универсальная ссылка СБП; она через app links должна отдать
+  /// управление приложению банка (Ozon Банк, Сбер, Т-Банк и т.д.).
+  bool _isBankHandoff(Uri uri) {
+    final h = uri.host.toLowerCase();
+    if (h == 'nspk.ru' || h.endsWith('.nspk.ru')) return true; // СБП
+    if (h == 'sbp.ru' || h.endsWith('.sbp.ru')) return true;
+    // Ozon: во время оплаты редирект уходит на finance.ozon.ru / ozon.ru —
+    // это переход в приложение Ozon Банка, не контент нашего сайта.
+    if (h == 'finance.ozon.ru' || h == 'ozon.ru' || h == 'www.ozon.ru') return true;
+    return false;
+  }
+
   late final WebViewController _controller;
   late final StreamSubscription<List<ConnectivityResult>> _connSub;
 
@@ -55,12 +69,20 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
         NavigationDelegate(
           onPageStarted: (url) {
             _beginPageLoad();
-            // Синхронная замена addJavascriptInterface("Android", isApp()) —
-            // JavaScriptChannel в webview_flutter асинхронный (postMessage),
-            // поэтому сайту отдаём обычный синхронный метод через инъекцию JS.
+            // 1) Синхронная замена addJavascriptInterface("Android", isApp()) —
+            //    JavaScriptChannel в webview_flutter асинхронный (postMessage),
+            //    поэтому сайту отдаём обычный синхронный метод через инъекцию JS.
+            // 2) window.open(url) → навигация в текущем окне: платёжные виджеты
+            //    часто открывают ссылку банка/СБП через window.open, а WebView
+            //    без обработчика новых окон её молча теряет → «оплата невозможна».
+            //    После подмены переход проходит через onNavigationRequest и
+            //    отдаётся приложению банка.
             _controller.runJavaScript(
-              'window.Android = window.Android || {}; '
-              'window.Android.isApp = function() { return true; };',
+              'window.Android = window.Android || {};'
+              'window.Android.isApp = function() { return true; };'
+              '(function(){var o=window.open;window.open=function(u){'
+              'if(u){try{window.location.href=String(u);}catch(e){}return null;}'
+              'return o?o.apply(window,arguments):null;};})();',
             );
           },
           onPageFinished: (url) {
@@ -79,28 +101,7 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
               _showOfflinePlaceholder();
             }
           },
-          onNavigationRequest: (request) async {
-            final uri = Uri.parse(request.url);
-
-            if (request.url.toLowerCase().endsWith('.pdf')) {
-              final viewerUrl =
-                  'https://docs.google.com/gview?embedded=true&url=${Uri.encodeComponent(request.url)}';
-              _controller.loadRequest(Uri.parse(viewerUrl));
-              return NavigationDecision.prevent;
-            }
-
-            if (uri.scheme == 'http' || uri.scheme == 'https') {
-              return NavigationDecision.navigate;
-            }
-
-            final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
-            if (!opened && mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Приложение банка не найдено')),
-              );
-            }
-            return NavigationDecision.prevent;
-          },
+          onNavigationRequest: _handleNavigation,
         ),
       )
       ..loadRequest(Uri.parse(widget.initialUrl ?? _homeUrl));
@@ -125,6 +126,59 @@ class _MainWebViewScreenState extends State<MainWebViewScreen> {
     _loadTimeoutTimer?.cancel();
     _connSub.cancel();
     super.dispose();
+  }
+
+  /// Решение по каждой навигации WebView. Логика:
+  /// - `.pdf` → внешний просмотрщик Google;
+  /// - http/https на СБП/банк-хост → отдать нативному приложению (иначе оплата
+  ///   зависнет отрендеренной страницей);
+  /// - прочий http/https → грузить в WebView;
+  /// - любая другая схема (`bankXXX://`, `ozonbank://`, `intent://`, `tel:` …) →
+  ///   отдать в ОС.
+  Future<NavigationDecision> _handleNavigation(NavigationRequest request) async {
+    final uri = Uri.tryParse(request.url);
+    if (uri == null) return NavigationDecision.navigate;
+
+    if (request.url.toLowerCase().endsWith('.pdf')) {
+      _controller.loadRequest(Uri.parse(
+        'https://docs.google.com/gview?embedded=true&url=${Uri.encodeComponent(request.url)}',
+      ));
+      return NavigationDecision.prevent;
+    }
+
+    final isWeb = uri.scheme == 'http' || uri.scheme == 'https';
+
+    if (isWeb) {
+      if (request.isMainFrame && _isBankHandoff(uri)) {
+        await _openExternally(uri);
+        return NavigationDecision.prevent;
+      }
+      return NavigationDecision.navigate;
+    }
+
+    // Не http/https — это deep link приложения (банк, СБП, звонок, почта).
+    await _openExternally(uri);
+    return NavigationDecision.prevent;
+  }
+
+  Future<void> _openExternally(Uri uri) async {
+    final messenger = ScaffoldMessenger.of(context);
+    var opened = false;
+    try {
+      opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      opened = false;
+    }
+    if (opened) return;
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Не удалось открыть приложение банка. Установите приложение банка '
+          '(Ozon Банк, Сбербанк, Т-Банк …) и повторите оплату.',
+        ),
+        duration: Duration(seconds: 5),
+      ),
+    );
   }
 
   /// Аналог showPendingPushDialog() — как только страница догрузилась и есть
