@@ -1,5 +1,21 @@
 import 'package:flutter/services.dart';
 
+/// Приводит сохранённый номер к виду `+7 (999) 123-45-67` для показа.
+/// Принимает `+79991234567`, `79991234567`, `89991234567`, `9991234567`.
+/// Если цифр не хватает на полный номер — возвращает исходную строку как есть
+/// (например, серверную маску `+7•••95`).
+String formatRuPhone(String raw) {
+  var digits = raw.replaceAll(RegExp(r'\D'), '');
+  if (digits.startsWith('8')) {
+    digits = '7${digits.substring(1)}';
+  } else if (!digits.startsWith('7')) {
+    digits = '7$digits';
+  }
+  if (digits.length < 11) return raw;
+  final r = digits.substring(1, 11);
+  return '+7 (${r.substring(0, 3)}) ${r.substring(3, 6)}-${r.substring(6, 8)}-${r.substring(8, 10)}';
+}
+
 /// Маска ввода номера: +7 (999) 123-45-67. Аналог PhoneMaskWatcher.kt.
 ///
 /// Курсор ведётся по КОЛИЧЕСТВУ ЦИФР слева от него, а не по позиции символа —

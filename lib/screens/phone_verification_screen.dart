@@ -41,6 +41,12 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
   String _currentPhone = '';
   String _currentUserId = '';
 
+  /// Зарегистрированный номер для показа в подключённом состоянии, уже
+  /// отформатированный (`+7 (999) 123-45-67`). Приоритет — полный
+  /// `verified_phone`; если его нет (привязка восстановлена с сервера) —
+  /// серверная маска `verified_phone_mask` как есть.
+  String _verifiedPhone = '';
+
   List<PushItem> _history = [];
 
   @override
@@ -90,16 +96,21 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
     if (!mounted) return;
     setState(() {
       _isVerified = verifiedLocal;
+      _verifiedPhone = _readPhone(prefs);
       _history = history0;
       _loading = false;
     });
 
     // ШАГ 2. Тихая синхронизация с сервером в фоне. Если локально «не
-    // привязан» — спросим сервер (источник истины): флаг мог потеряться
-    // из-за очистки префов на MIUI / переустановки. Плюс подтянем из
-    // серверного ящика пропущенные уведомления.
+    // привязан» — спросим сервер по device_uuid (источник истины): флаг мог
+    // потеряться из-за очистки префов на MIUI / переустановки, ИЛИ пользователь
+    // уже подключал персональные пуши на этом устройстве раньше. В этом случае
+    // включаем их сразу — без повторного ввода номера и кода из SMS.
     if (!verifiedLocal) {
-      await PushService.reconcileBindState();
+      final restored = await PushService.reconcileBindState();
+      if (restored) {
+        await PushService.refreshServerRegistration();
+      }
     }
     await PushService.syncInbox();
 
@@ -108,8 +119,17 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
     if (!mounted) return;
     setState(() {
       _isVerified = verifiedAfter;
+      _verifiedPhone = _readPhone(prefs);
       _history = history1;
     });
+  }
+
+  /// Номер для подключённого состояния: приоритет — полный `verified_phone`
+  /// (форматируем в `+7 (999) 123-45-67`), иначе — серверная маска как есть.
+  String _readPhone(SharedPreferences prefs) {
+    final full = prefs.getString('verified_phone') ?? '';
+    if (full.isNotEmpty) return formatRuPhone(full);
+    return prefs.getString('verified_phone_mask') ?? '';
   }
 
   String _statusMessage(int status, String statusText) {
@@ -250,15 +270,15 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Отключить уведомления?'),
+        title: const Text('Отписаться от персональных пушей?'),
         content: const Text(
-          'Вы перестанете получать персональные push-уведомления, и коды '
-          'подтверждения будут приходить через SMS. Чтобы включить их снова, '
-          'нужно будет привязать номер ещё раз.',
+          'Сообщения ломбарда и коды подтверждения будут приходить по SMS. '
+          'Снова подключить персональные пуши можно в любой момент — '
+          'достаточно подтвердить номер телефона.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Отключить')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Отписаться')),
         ],
       ),
     );
@@ -278,7 +298,7 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
 
     setState(() {
       _busy = true;
-      _statusText = 'Отключение уведомлений...';
+      _statusText = 'Отписываем от персональных пушей...';
     });
 
     try {
@@ -296,12 +316,12 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
         await _clearVerificationLocally();
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Уведомления отключены')),
+            const SnackBar(content: Text('Вы отписались от персональных пушей')),
           );
         }
       } else {
         setState(() {
-          _statusText = json['message'] as String? ?? 'Не удалось отключить уведомления';
+          _statusText = json['message'] as String? ?? 'Не удалось отписаться от персональных пушей';
           _busy = false;
         });
       }
@@ -318,6 +338,7 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
     await prefs.setBool('phone_verified', false);
     await prefs.remove('verified_user_id');
     await prefs.remove('verified_phone');
+    await prefs.remove('verified_phone_mask');
 
     _phoneController.clear();
     _codeController.clear();
@@ -328,7 +349,8 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
       _currentUserId = '';
       _currentPhone = '';
       _currentKod = '';
-      _statusText = 'Уведомления отключены. Можете привязать другой номер.';
+      _verifiedPhone = '';
+      _statusText = 'Вы отписались от персональных пушей. Можно подключить снова или привязать другой номер.';
     });
   }
 
@@ -400,17 +422,39 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
                 ),
               if (_isVerified) ...[
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 24),
+                  padding: const EdgeInsets.only(bottom: 8),
                   child: Text(
-                    '✅ Вы уже подключили персональные уведомления',
+                    '✅ Персональные push-уведомления подключены',
                     style: TextStyle(fontSize: 16, color: cs.onSurface),
                   ),
                 ),
-                SizedBox(
-                  height: 52,
-                  child: OutlinedButton(
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 20),
+                  child: Text(
+                    _verifiedPhone.isNotEmpty
+                        ? 'На этом устройстве зарегистрирован номер $_verifiedPhone. '
+                            'Сообщения ломбарда и коды подтверждения приходят push-уведомлением.'
+                        : 'Номер телефона зарегистрирован на этом устройстве. '
+                            'Сообщения ломбарда и коды подтверждения приходят push-уведомлением.',
+                    style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
                     onPressed: _busy ? null : _onDisconnect,
-                    child: const Text('Отключить персональные push уведомления'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: cs.onSurfaceVariant,
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(0, 36),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      textStyle: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w400,
+                        decoration: TextDecoration.underline,
+                      ),
+                    ),
+                    child: const Text('Отписаться от персональных пушей'),
                   ),
                 ),
               ] else if (!_showCodeStep) ...[

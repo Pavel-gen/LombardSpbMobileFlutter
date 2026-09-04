@@ -116,6 +116,8 @@ class _LombardAppState extends State<LombardApp> with WidgetsBindingObserver {
       PushService.retryTokenIfMissing();
       // Подтянуть из серверного ящика всё, что не дошло пушем.
       unawaited(PushService.syncInbox());
+      // Дослать подтверждения доставки, не ушедшие в момент приёма пуша.
+      unawaited(PushService.flushPendingAcks());
     } else if (state == AppLifecycleState.paused) {
       unawaited(AppLog.event('lifecycle_paused'));
       unawaited(AppLog.flush(force: true)); // уходим в фон — выгружаем журнал

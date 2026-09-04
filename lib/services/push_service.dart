@@ -90,6 +90,7 @@ class PushService {
     _tokenInProgress = false;
     _tokenSentOk = false;
     _inboxInProgress = false;
+    _ackFlushInProgress = false;
   }
 
   /// Тест-обёртки над приватными обработчиками.
@@ -97,7 +98,7 @@ class PushService {
   static Future<void> debugHandleData(Map<String, dynamic> data, {String source = 'test'}) =>
       _handleMessage(RemoteMessage(data: data), source: source);
   @visibleForTesting
-  static Future<void> debugSendAck(String msgId, String source) => _sendAck(msgId, source);
+  static Future<void> debugSendAck(String msgId, String source) => _enqueueAck(msgId, source);
 
   /// Последний успешно полученный FCM-токен в этой сессии. null — значит на
   /// устройстве токен ещё ни разу не сгенерировался (см. ensureToken()).
@@ -179,6 +180,8 @@ class PushService {
       } else if (!_tokenSentOk) {
         unawaited(_sendTokenToServer(_lastToken!));
       }
+      // Сеть вернулась — дослать подтверждения доставки, застрявшие офлайн.
+      unawaited(flushPendingAcks());
     });
 
     // Разрешение и получение токена НЕ ждём здесь — иначе холодный старт
@@ -205,8 +208,17 @@ class PushService {
     // после получения токена — сверить привязку номера с сервером
     // (лечит «разлогин» из-за потери локальных префов) и подтянуть из ящика
     // всё, что не дошло пушем.
-    await reconcileBindState();
+    final restored = await reconcileBindState();
+    if (restored) {
+      // Сервер узнал устройство по device_uuid и вернул user_id — то есть
+      // пользователь уже подключал персональные пуши раньше. Сразу
+      // до-регистрируем токен с известным теперь user_id, чтобы серверная
+      // строка токена получила владельца и сервер включил push-канал в 1С
+      // (setpush(1)) — не дожидаясь следующего запуска приложения.
+      await refreshServerRegistration();
+    }
     unawaited(syncInbox());
+    unawaited(flushPendingAcks());
   }
 
   /// Пытается получить FCM-токен с ретраями. На каждой неудаче шлёт подробную
@@ -275,7 +287,18 @@ class PushService {
   /// переустановка, сбой миграции shared_preferences) — восстанавливаем его.
   /// Только ДОБАВЛЯЕМ привязку; из-за ошибки/недоступности сервера ничего не
   /// снимаем — иначе разлогинили бы при первом сбое сети.
-  static Future<void> reconcileBindState() async {
+  ///
+  /// «Привязан» = сервер вернул `bound:true` И знает `user_id` клиента 1С.
+  /// Часть установок — «только пуши без привязки»: FCM-токен на сервере есть,
+  /// но `user_id` пустой (пользователь дал разрешение на уведомления, но номер
+  /// не подтверждал). Для них `bind-status.php` возвращает `bound:false`; здесь
+  /// дополнительно страхуемся от `bound:true` с пустым `user_id` — иначе экран
+  /// показал бы «подключено», а в 1С этого клиента нет (мусорное состояние).
+  ///
+  /// Возвращает `true`, только если привязка была ВОССТАНОВЛЕНА в этом вызове
+  /// (сервер знает device_uuid и user_id, а локально флага не было). Вызывающий
+  /// код по этому признаку до-регистрирует токен с уже известным user_id.
+  static Future<bool> reconcileBindState() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final alreadyVerified = prefs.getBool('phone_verified') ?? false;
@@ -288,31 +311,63 @@ class PushService {
             body: jsonEncode({'device_uuid': deviceId, if (_lastToken != null) 'token': _lastToken}),
           )
           .timeout(const Duration(seconds: 10));
-      if (resp.statusCode != 200) return;
+      if (resp.statusCode != 200) return false;
 
       final j = jsonDecode(resp.body) as Map<String, dynamic>;
-      final bound = j['bound'] == true;
+      final serverBound = j['bound'] == true;
+      final uid = (j['user_id'] as String?)?.trim() ?? '';
+      final bound = serverBound && uid.isNotEmpty;
       unawaited(AppLog.event('bind_status', {
-        'server_bound': bound,
+        'server_bound': serverBound,
+        'has_user_id': uid.isNotEmpty,
         'push_enabled': j['push_enabled'] == true,
         'local_verified': alreadyVerified,
       }));
-      if (bound && !alreadyVerified) {
-        await prefs.setBool('phone_verified', true);
-        final uid = j['user_id'] as String?;
-        if (uid != null && uid.isNotEmpty) {
-          await prefs.setString('verified_user_id', uid);
-        }
-        final mask = j['phone_mask'] as String?;
-        if (mask != null && mask.isNotEmpty) {
-          await prefs.setString('verified_phone_mask', mask);
-        }
-        _log('bind state restored from server (user $uid)');
-        unawaited(AppLog.event('bind_restored', {'user': uid}));
+      if (!bound) return false;
+
+      // Номер для показа на экране «Уведомления» сохраняем всегда, когда сервер
+      // его прислал. Если `bind-status.php` отдаёт полный `phone` — показываем
+      // его без маски; иначе оседает хотя бы маска `phone_mask`.
+      final fullPhone = j['phone'] as String?;
+      if (fullPhone != null && fullPhone.isNotEmpty) {
+        await prefs.setString('verified_phone', fullPhone);
       }
+      final mask = j['phone_mask'] as String?;
+      if (mask != null && mask.isNotEmpty) {
+        await prefs.setString('verified_phone_mask', mask);
+      }
+
+      if (alreadyVerified) return false;
+
+      await prefs.setBool('phone_verified', true);
+      await prefs.setString('verified_user_id', uid);
+      _log('bind state restored from server (user $uid)');
+      unawaited(AppLog.event('bind_restored', {'user': uid}));
+      return true;
     } catch (e) {
       _log('reconcileBindState failed: $e');
       unawaited(AppLog.event('bind_status_fail', {'err': '$e'}));
+      return false;
+    }
+  }
+
+  /// Повторно регистрирует ТЕКУЩИЙ FCM-токен на сервере с актуальными данными
+  /// из SharedPreferences (в первую очередь — user_id). Вызывается сразу после
+  /// того, как привязка номера восстановлена по device_uuid: без этого
+  /// серверная строка токена осталась бы без владельца до следующего запуска
+  /// приложения / onTokenRefresh.
+  ///
+  /// Если токен в этой сессии ещё не получен (`_lastToken == null`) — ничего не
+  /// делаем: его отправит обычный путь `ensureToken()`, а из `_bootstrapMessaging`
+  /// этот метод и так вызывается уже после `ensureToken()`.
+  static Future<void> refreshServerRegistration() async {
+    final token = _lastToken;
+    if (token == null || token.isEmpty) return;
+    try {
+      await _sendTokenToServer(token);
+    } catch (e) {
+      _log('refreshServerRegistration failed: $e');
+      unawaited(AppLog.event('token_reregister_fail', {'err': '$e'}));
     }
   }
 
@@ -401,6 +456,7 @@ class PushService {
           attempt: -1, error: e, stack: s, note: 'bg_worker'));
     }
     await syncInbox();
+    await flushPendingAcks();
     await AppLog.flush(force: true);
   }
 
@@ -539,8 +595,19 @@ class PushService {
       unawaited(AppLog.event('refresh_ping_received', {'source': source}));
       await ensureToken(force: true);
       await syncInbox(); // раз уж подняли изолят — подтянем пропущенные уведомления
+      unawaited(flushPendingAcks());
       unawaited(AppLog.flush(force: true));
       return;
+    }
+
+    // Сервер может принудительно попросить перерегистрировать токен и обычным
+    // (не тихим) пушем — data.refresh_token=1. Полезно, когда сервер заметил,
+    // что доставка на текущий токен деградирует, но пуш пока доходит. Токен
+    // обновляем в фоне и продолжаем обычный показ самого сообщения.
+    final rt = data['refresh_token'];
+    if (rt == '1' || rt == 1 || rt == true) {
+      unawaited(AppLog.event('force_token_refresh', {'source': source}));
+      unawaited(ensureToken(force: true));
     }
 
     final title = data['title'] as String? ?? 'Уведомление';
@@ -550,9 +617,11 @@ class PushService {
 
     unawaited(AppLog.event('push_received', {'msg_id': msgId, 'source': source}));
 
-    // Подтверждаем доставку СРАЗУ (fire-and-forget), до показа уведомления —
-    // работает и в foreground, и в headless-изоляте на убитом приложении.
-    unawaited(_sendAck(msgId, source));
+    // Ставим подтверждение доставки в очередь и шлём СРАЗУ, до показа
+    // уведомления. Если POST не пройдёт (обрыв связи в момент приёма) —
+    // подтверждение останется в очереди и уйдёт при следующем старте /
+    // возврате в приложение / появлении сети / syncInbox / фоновом воркере.
+    unawaited(_enqueueAck(msgId, source));
 
     final id = await PushStorage.addPush(title: title, body: body, link: link, msgId: msgId);
     if (id.isEmpty) return; // дубль (msg_id уже в истории) — уведомление не повторяем
@@ -607,22 +676,75 @@ class PushService {
       final push = PendingPush.fromJson(map);
       pendingPush.value = push;
       // Тап по уведомлению — тоже подтверждение доставки (на случай, если
-      // headless-хендлер не поднялся). Дедуп по msg_id внутри _sendAck.
-      unawaited(_sendAck(push.msgId, 'tap'));
+      // headless-хендлер не поднялся). Дедуп по msg_id внутри очереди ack.
+      unawaited(_enqueueAck(push.msgId, 'tap'));
     } catch (_) {
       // Некорректный payload — просто игнорируем тап.
     }
   }
 
-  // --- Подтверждение доставки пуша (push-ack) ---------------------------------
+  // --- Подтверждение доставки пуша (push-ack) --------------------------------
+  //
+  // Ack — единственный сигнал «пуш реально дошёл до устройства». Поэтому он НЕ
+  // fire-and-forget: неотправленные подтверждения складываются в очередь
+  // `pending_acks` и до-сылаются при старте, возврате в приложение, появлении
+  // сети, syncInbox и фоновом воркере. Иначе секундный обрыв связи в момент
+  // приёма пуша = потерянный ack → сервер считает «не доставлено» и шлёт
+  // лишнюю SMS (а раньше ещё и «замок» на 7 дней).
 
-  static const _ackedKey = 'acked_msg_ids';
+  static const _ackedKey = 'acked_msg_ids';       // успешно подтверждённые (дедуп)
   static const _ackedMax = 300;
+  static const _pendingAckKey = 'pending_acks';   // ждут отправки: "<msgId>#<source>"
+  static const _pendingAckMax = 200;
+  static const _ackSep = '#'; // msgId — hex, source — слово; '#' в них не встречается
+  static bool _ackFlushInProgress = false;
 
-  /// Один msg_id — один ack. fire-and-forget, до 2 попыток при сетевой ошибке.
-  static Future<void> _sendAck(String msgId, String source) async {
+  /// Поставить подтверждение в очередь и сразу попытаться отправить.
+  static Future<void> _enqueueAck(String msgId, String source) async {
     if (msgId.isEmpty) return;
     if (await _isAcked(msgId)) return;
+    await _addPendingAck(msgId, source);
+    await flushPendingAcks();
+  }
+
+  /// Дослать все неподтверждённые ack. Безопасно дёргать часто и из разных мест
+  /// (guard `_ackFlushInProgress`). Успех → в `acked_msg_ids`; неудача →
+  /// остаётся в очереди до следующего вызова.
+  static Future<void> flushPendingAcks() async {
+    if (_ackFlushInProgress) return;
+    _ackFlushInProgress = true;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final pending = p.getStringList(_pendingAckKey) ?? const <String>[];
+      if (pending.isEmpty) return;
+      final keep = <String>[];
+      var sent = 0;
+      for (final entry in pending) {
+        final i = entry.indexOf(_ackSep);
+        final msgId = i >= 0 ? entry.substring(0, i) : entry;
+        final source = i >= 0 ? entry.substring(i + 1) : 'queued';
+        if (msgId.isEmpty) continue;
+        if (await _isAcked(msgId)) continue;
+        if (await _postAck(msgId, source)) {
+          await _markAcked(msgId);
+          sent++;
+        } else {
+          keep.add(entry);
+        }
+      }
+      await p.setStringList(_pendingAckKey, keep);
+      if (sent > 0 || keep.isNotEmpty) {
+        unawaited(AppLog.event('ack_flush', {'sent': sent, 'pending': keep.length}));
+      }
+    } catch (e) {
+      _log('flushPendingAcks failed: $e');
+    } finally {
+      _ackFlushInProgress = false;
+    }
+  }
+
+  /// Один POST на push-ack.php (2 быстрых попытки). true — сервер принял (2xx).
+  static Future<bool> _postAck(String msgId, String source) async {
     for (var attempt = 0; attempt < 2; attempt++) {
       try {
         final r = await httpClient
@@ -633,10 +755,9 @@ class PushService {
             )
             .timeout(const Duration(seconds: 8));
         if (r.statusCode >= 200 && r.statusCode < 300) {
-          await _markAcked(msgId);
           _log('ack ok $msgId ($source)');
           unawaited(AppLog.event('ack_ok', {'msg_id': msgId, 'src': source, 'try': attempt}));
-          return;
+          return true;
         }
         _log('ack $msgId: HTTP ${r.statusCode}');
       } catch (e) {
@@ -644,7 +765,21 @@ class PushService {
       }
       if (attempt == 0) await Future.delayed(const Duration(seconds: 2));
     }
-    unawaited(AppLog.event('ack_fail', {'msg_id': msgId, 'src': source}));
+    unawaited(AppLog.event('ack_retry_later', {'msg_id': msgId, 'src': source}));
+    return false;
+  }
+
+  static Future<void> _addPendingAck(String msgId, String source) async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final list = [...(p.getStringList(_pendingAckKey) ?? const <String>[])];
+      if (list.any((e) => e == msgId || e.startsWith('$msgId$_ackSep'))) return;
+      list.add('$msgId$_ackSep$source');
+      while (list.length > _pendingAckMax) {
+        list.removeAt(0);
+      }
+      await p.setStringList(_pendingAckKey, list);
+    } catch (_) {}
   }
 
   static Future<bool> _isAcked(String msgId) async {

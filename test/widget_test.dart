@@ -17,12 +17,13 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     messenger.setMockMethodCallHandler(_connMethod, (call) async {
-      if (call.method == 'check') return 'wifi';
+      // connectivity_plus 6.x: check → invokeListMethod, ждёт List, не String.
+      if (call.method == 'check') return <String>['wifi'];
       return null;
     });
     messenger.setMockStreamHandler(
       _connEvent,
-      MockStreamHandler.inline(onListen: (args, sink) => sink.success('wifi')),
+      MockStreamHandler.inline(onListen: (args, sink) => sink.success(<String>['wifi'])),
     );
   });
 

@@ -45,7 +45,7 @@ Push — это **не** гарантированная доставка. Это
 | **msg_id** | 32 hex-символа. Уникальный номер одного отправленного сообщения одному клиенту. По нему приложение подтверждает доставку, а сервер понимает «за что пришёл ack» и не дублирует запись в истории/ящике. |
 | **id_send / ID_send** | Номер одной **рассылки** от 1С (в ней может быть много клиентов). Внутри рассылки у каждого клиента свой `msg_id`. |
 | **data-only push** | Пуш без готового «заголовок+текст» от Google. Внутри только данные (`title`, `body`, `link`, `msg_id`). Само приложение решает, показывать ли уведомление и какое. Нужно, чтобы код приложения выполнялся даже когда пуш пришёл на закрытое приложение (иначе не отправить ack, не записать в историю). |
-| **ack** (acknowledgement) | «Квитанция». Приложение получило пуш → сразу дёргает сервер: «msg_id такой-то — доставлен». Нет квитанции за 20 минут → сервер считает, что не дошло, и говорит 1С слать SMS. |
+| **ack** (acknowledgement) | «Квитанция». Приложение получило пуш → дёргает сервер: «msg_id такой-то — доставлен». Ack не fire-and-forget: если POST не прошёл (обрыв связи), msg_id лежит в очереди `pending_acks` и до-сылается при старте / resume / появлении сети / syncInbox / фоновом воркере. Нет квитанции за окно → сервер **повторяет пуш** (окна 5→10→20→30 мин), и только после всех попыток без ack говорит 1С слать SMS. |
 | **inbox / user_inbox** | Серверный «ящик» сообщений по каждому клиенту. Пуш мог не дойти (телефон был выключен неделю, токен сдох) — но в ящике сообщение лежит. Приложение при старте спрашивает «что я пропустил?» и забирает пачкой. |
 | **outbox / push_outbox** | Серверная **очередь на отправку**. 1С кладёт задачу в очередь и сразу свободна; отдельный процесс (воркер) её разгребает. Если сервер упал на середине — задача не потеряется, доразошлётся. |
 | **headless-изолят** | Кусок кода приложения, который ОС запускает **без экрана**, когда пришёл пуш или сработал фоновый таймер. Отдельная мини-копия движка Dart. Там нет UI, но можно ходить в сеть и в память. |
@@ -289,8 +289,8 @@ HTTP, а по расписанию** (cron) — это фоновые задач
 | 1 | `POST fcm-token.php` | старт приложения (получен токен), `onTokenRefresh`, возврат сети после неудачи, фоновый воркер | `token, user_id, device_uuid, platform, device_model, app_version, os_version, app_source:"flutter", push_ack:true` | upsert в `fcm_tokens` по `device_uuid` (одна строка на телефон). Сбрасывает `disabled_at`, `fail_count`. Если это первый живой токен клиента — зовёт в 1С `setpush(1)` (включить push-канал). |
 | 2 | `POST fcm-token.php?action=delete` | клиент нажал «Отключить персональные уведомления» | `token, user_id, device_uuid, reason, app_source` | гасит токен, зовёт в 1С `setpush(0)` (клиента — на SMS). Приложение параллельно делает `FirebaseMessaging.deleteToken()`. |
 | 3 | `POST fcm-log.php` | **каждая неудача** получения токена; «получилось, но не с первой попытки»; фоновый воркер без токена | большой JSON диагностики: `stage, attempt, device_uuid, app_version, platform, os_version, device_model, brand, play_services (!), authorization_status, auto_init_enabled, error_type, error_code, error_message, stack` | пишет строку в `fcm_diag_log` + в файловый лог. Смотреть — `fcm-log-view.php`. Это ответ на «почему у 69 из 1000 нет токена». |
-| 4 | `POST push-ack.php` | **сразу** при приёме любого пуша (foreground / headless / тап). До показа уведомления. | `msg_id, source` (`foreground`/`background`/`tap`) | `push_send_log.acked_at = NOW` по `msg_id`; `fcm_tokens.push_ack=1` (устройство доказало, что умеет ack); если есть `push_send_recipient` — `status_final=1` (доставлено). В 1С сам **не** ходит — это делает крон. Идемпотентно (локальный список `acked_msg_ids`, последние 300). |
-| 5 | `POST bind-status.php` | старт приложения (после токена); экран «Персональные уведомления», если локально `phone_verified=false` | `device_uuid, token?` | ищет в `fcm_tokens` по `device_uuid`, потом по `token`. Отвечает `{bound, push_enabled, user_id, phone_mask, verified_at}`. `bound=true` ⇔ есть `user_id` и `verified_at`. **Только чтение.** Приложение по ответу может ВОССТАНОВИТЬ `phone_verified` (никогда не снимает). |
+| 4 | `POST push-ack.php` | при приёме любого пуша (foreground / headless / тап) + до-отправка из очереди `pending_acks` при старте/resume/сети/syncInbox/воркере | `msg_id, source` (`foreground`/`background`/`tap`/`queued`) | `push_send_log.acked_at = NOW` по `msg_id`; `fcm_tokens.push_ack=1, ack_declared=1` (устройство доказало, что умеет ack); если есть `push_send_recipient` — `status_final=1` (доставлено), `next_check_at=NULL`. В 1С сам **не** ходит — это делает крон. Идемпотентно (`acked_msg_ids` 300 + очередь `pending_acks`). |
+| 5 | `POST bind-status.php` | старт приложения (после токена); экран «Уведомления», если локально `phone_verified=false` | `device_uuid, token?` | ищет в `fcm_tokens` по `device_uuid`, потом по `token`. Отвечает `{bound, push_enabled, user_id, phone (полный, желательно), phone_mask, verified_at}`. Приложение считает «привязан» ⇔ `bound=true` **И** непустой `user_id`. **Только чтение.** Приложение по ответу может ВОССТАНОВИТЬ `phone_verified` (никогда не снимает) и показать номер **без маски** (`phone`; `phone_mask` — запасной вариант) («зарегистрирован номер …»). Если привязка восстановлена — приложение сразу шлёт `fcm-token.php` уже с `user_id` (запрос 1), не дожидаясь перезапуска. |
 | 6 | `GET inbox.php?user_id=&device_uuid=&since_id=&limit=100` | старт приложения, возврат в приложение (`resumed`), приход тихого пинга `token_refresh`, фоновый воркер — **только если номер привязан** | параметры в URL | проверяет, что `device_uuid` принадлежит `user_id` (`SELECT 1 FROM fcm_tokens …`). Отдаёт `{items:[{id,msg_id,title,body,link,created_at,delivered_at}], last_id}` — всё с `id > since_id` за 90 дней. |
 | 7 | `POST inbox.php` | после успешного GupG inbox, если пришло новое | `user_id, device_uuid, last_id` (или `fetched_ids[]`) | ставит `fetched_at` забранным строкам `user_inbox`. |
 | 8 | `POST app-log.php` | пачками: срочно на ошибках, каждые 40 событий, при уходе в фон, раз в 6 ч | `install_id, session_id, app_version, device_uuid, app_source:"flutter", events:[{t,e,d}, …]` (до 400) | вставляет строки в `app_event_log` + файловый лог. Всегда отвечает `{status:ok}`. Смотреть — `app-log-view.php`. |
@@ -316,6 +316,7 @@ HTTP, а по расписанию** (cron) — это фоновые задач
 | **Персональный пуш** | воркер `push-outbox-worker.php` (задачу поставила 1С через `1c_send_push.php`) | `title, body, link, msg_id, id_send` | headless-изолят: сразу `push-ack.php`, затем запись в локальную историю (дедуп по `msg_id`), затем показ уведомления. |
 | **Массовый пуш** | `push-admin.php` (человек из админки, под паролем) | `title, body, link, msg_id` | то же самое; но по нему нет `push_send_recipient`, значит нет SMS-догонки. Ack всё равно «учит» устройство (`push_ack=1`). |
 | **Тихий пинг `token_refresh`** | cron `push-refresh-ping.php` | `type: "token_refresh"` (без title/body) | НЕ показывает уведомление, НЕ пишет в историю, НЕ шлёт ack. Делает `ensureToken(force:true)` → новый токен на сервер, затем `syncInbox()`, затем выгрузка журнала. Оживляет устройства, которые давно не открывали. |
+| **Контентный пуш с флагом `refresh_token`** | любой отправитель, если положил в `data` `refresh_token:"1"` | `title, body, link, msg_id, refresh_token:"1"` | показывает сообщение как обычный пуш И вдобавок в фоне делает `ensureToken(force:true)` → переотправляет токен. Ручка на случай «доставка деградирует, но пуш ещё проходит». |
 
 **Как формируется персональный пуш (кратко, детали — `PUSH-FLOW.md`):**
 
@@ -341,11 +342,13 @@ cron push-outbox-worker.php (раз в минуту)
      │
      └─ по решённым (0 и 1) — сразу pushReportOneSend() → POST 1c/pushresult
 
-telegram приложения: пришёл пуш → POST push-ack.php {msg_id}
+приложение: пришёл пуш → POST push-ack.php {msg_id}  (или из очереди pending_acks позже)
      │  push_send_recipient.status_final = 1
 
 cron push-reconcile.php (раз в минуту)
-     ├─ кто ждёт ack > 20 мин → status_final = 0 (ack_timeout)
+     ├─ кто ждёт ack и вышло окно:
+     │     попытки < 4  → ПОВТОРНАЯ отправка пуша, next_check_at += (5→10→20→30 мин)
+     │     попытки = 4  → status_final = 0 (ack_timeout)
      ├─ у кого вердикт готов, а в 1С не ушёл → POST 1c/pushresult
      │     Status=0 → 1С шлёт клиенту SMS (догонка)
      │     Status=1 → доставлено, всё
@@ -375,9 +378,9 @@ cron push-reconcile.php (раз в минуту)
 
 | Таблица | Одна строка = | Живёт |
 |---|---|---|
-| `fcm_tokens` | одна установка приложения (`device_uuid` уникален). `token, user_id, disabled_at, disabled_reason, fail_count, last_success_at, push_ack, ack_timeout_streak, push_ack_locked_until` | hard-delete через 30 дней после гашения (`fcm_cleanup.php`) |
+| `fcm_tokens` | одна установка приложения (`device_uuid` уникален). `token, user_id, disabled_at, disabled_reason, fail_count, last_success_at, push_ack, ack_declared (монотонный «умеет ack» — по нему рассылка решает, ждать ли подтверждения), ack_timeout_streak (диагностика), push_ack_locked_until (больше не используется)` | hard-delete через 30 дней после гашения (`fcm_cleanup.php`) |
 | `push_send_package` | одна рассылка от 1С (`id_send`). `status, req_hash, счётчики, pushresult_*` | вручную >90 дней |
-| `push_send_recipient` | один клиент в одной рассылке (`id_send`+`user_id`). `msg_id, status_final (NULL/0/1), decided_reason, acked_at, reported_at, report_attempts, dead_letter_at` | вручную >90 дней |
+| `push_send_recipient` | один клиент в одной рассылке (`id_send`+`user_id`). `msg_id, status_final (NULL/0/1), decided_reason, acked_at, reported_at, report_attempts, dead_letter_at, push_attempts, last_push_at, next_check_at (когда reconcile повторит пуш или добьёт Status=0)` | вручную >90 дней |
 | `push_send_log` | одна попытка отправки на один токен. `msg_id, result, fcm_class, token_outcome, http_code, error_message, acked_at` | вручную |
 | `push_outbox` | задача в очереди на отправку (`msg_id` уникален). `status (queued/done/failed), attempts` | — |
 | `user_inbox` | одно сообщение одному клиенту (`user_id`+`msg_id` уникальны). `title, body, link, created_at, delivered_at, fetched_at` | чистка >90 дней (`fcm_cleanup.php`) |
@@ -397,7 +400,7 @@ cron push-reconcile.php (раз в минуту)
 | Скрипт | Расписание | Что делает | Heartbeat |
 |---|---|---|---|
 | `push-outbox-worker.php` | раз в минуту | разгребает очередь `push_outbox`: шлёт пуши, пишет `user_inbox`, `push_send_recipient`, инлайн-отчёт в 1С | `outbox` |
-| `push-reconcile.php` | раз в минуту | ack-таймауты (20 мин → Status 0 → SMS), поздние ack, добивка отчётов в 1С, закрытие пакетов, dead-letter при `report_attempts>=20` | `reconcile` |
+| `push-reconcile.php` | раз в минуту | ждущие ack: повтор пуша с растущим окном (5→10→20→30 мин), после 4 попыток → Status 0 → SMS; поздние ack; добивка отчётов в 1С; закрытие пакетов; dead-letter при `report_attempts>=20` | `reconcile` |
 | `push-refresh-ping.php` | раз в сутки (например ночью) | тихий пуш `token_refresh` токенам, неактивным > 3 дней (пачкой до 800); отдельно — «тёмные» клиенты (привязан, но 0 живых токенов, активность >2 дней) → в 1С `setpush(0)` | `refresh_ping` |
 | `fcm_cleanup.php` | 04:00 | hard-delete токенов, погашенных >30 дней; гасит «висяки» >270 дней; чистит `app_event_log` >30д, `fcm_diag_log` >60д, `user_inbox` >90д | — |
 
@@ -424,8 +427,10 @@ Google, есть dead-letter и т.д. На это можно повесить �
    `setpush(1)`.
 
 ### 8.2. 1С шлёт клиенту сообщение
-См. схему в разделе 5. Итог: либо ack за 20 мин (Status 1), либо таймаут
-(Status 0 → 1С шлёт SMS). В любом случае сообщение лежит в `user_inbox`.
+См. схему в разделе 5. Итог: либо ack (Status 1) — в т.ч. поздний, после
+до-отправки из очереди `pending_acks`; либо сервер 4 раза повторил пуш
+(окна 5→10→20→30 мин) и всё равно нет ack → Status 0 → 1С шлёт SMS.
+В любом случае сообщение лежит в `user_inbox`.
 
 ### 8.3. Клиент удалил приложение
 1. 1С шлёт пуш → воркер → Google отвечает `UNREGISTERED`.
@@ -450,13 +455,17 @@ Google, есть dead-letter и т.д. На это можно повесить �
    приходят 3 сообщения пачкой → мёржатся в локальную историю (дедуп по
    `msg_id`) → клиент видит все три в «Истории уведомлений».
 
-### 8.6. У клиента MIUI стёр данные приложения (разлогин)
-1. `phone_verified` пропал. Экран показывает форму ввода номера.
-2. Но при старте `bind-status.php` по `device_uuid` находит: `bound:true`,
-   `user_id: …`. Приложение **восстанавливает** `phone_verified=true` и
-   `verified_user_id`. Экран перещёлкивается на «✅ подключено».
-3. `syncInbox()` до-тягивает историю.
-   (Именно это чинил фикс с крутилкой — чтобы шаг 1→2 не мигал.)
+### 8.6. Клиент переустановил приложение / MIUI стёр данные (разлогин) — но номер он уже подключал
+1. `phone_verified` пропал. Экран «Уведомления» показывает форму ввода номера.
+2. Но ещё до формы приложение шлёт `bind-status.php` по `device_uuid` (тот же,
+   пока приложение не снесли начисто) и находит: `bound:true`, `user_id: …`,
+   `phone_mask: …`. Приложение **восстанавливает** `phone_verified=true` и
+   `verified_user_id`, показывает «✅ Персональные push-уведомления подключены»
+   и «зарегистрирован номер …» — **без повторного ввода кода из SMS**.
+3. Сразу же приложение до-регистрирует токен (`fcm-token.php` уже с `user_id`)
+   → серверная строка токена получает владельца, сервер зовёт `setpush(1)`.
+4. `syncInbox()` до-тягивает историю.
+   (Отсутствие мигания шага 1→2 — это фикс с крутилкой.)
 
 ### 8.7. Google-сервисы на телефоне сломаны — токен вообще не генерится
 1. 6 попыток с ретраями, каждая неудача → `fcm-log.php` с
@@ -479,7 +488,8 @@ Google, есть dead-letter и т.д. На это можно повесить �
 | Стёрлись локальные данные | «разлогин», пропала история | `bind-status.php` (сервер — источник истины) + `inbox.php` |
 | Сервер упал посреди рассылки | часть клиентов без пуша | `push_outbox` — очередь, задачи переживают падение, воркер доразошлёт |
 | 1С прислала дубль рассылки | клиент получит 2 одинаковых | `req_hash` — дубль в пределах 90 сек отсекается |
-| Устройство перестало слать ack (баг/OEM) | ложные SMS-догонки | 3 таймаута подряд → `push_ack=0` на 7 дней (`push_ack_locked_until`); реальный ack снимает замок |
+| Ack не дошёл (обрыв связи в момент приёма) | сервер думает «не доставлено» | очередь `pending_acks` на телефоне — до-шлётся при старте/resume/сети/syncInbox/воркере |
+| Устройство реально не получает пуши (OEM убил / токен протух) | клиент не увидел | сервер 4 раза повторяет пуш (5→10→20→30 мин), затем честно Status 0 → 1С шлёт SMS; сообщение в `inbox`. «Замка» больше нет — недоставка не маскируется под «доставлено» |
 | Крон завис | тихо копится очередь | `flock` + `job_heartbeat` + `health.php` отдаёт 503 |
 | Ошибка в приложении у клиента | не видно с той стороны | `runZonedGuarded` + `AppLog` → `app-log.php`, видно в `app-log-view.php` |
 

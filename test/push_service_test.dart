@@ -2,6 +2,7 @@
 // `flutter test` (SharedPreferences mock + MockClient вместо сети).
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -11,15 +12,25 @@ import 'package:lombardspb/services/app_log.dart';
 import 'package:lombardspb/services/push_service.dart';
 import 'package:lombardspb/services/push_storage.dart';
 
+// resolveDeviceId() дергает канал android_id — на хосте плагина нет, мокируем.
+const _androidIdChannel = MethodChannel('android_id');
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    messenger.setMockMethodCallHandler(
+      _androidIdChannel,
+      (call) async => call.method == 'getId' ? 'test-device-uuid' : null,
+    );
     PushService.resetForTest();
     AppLog.resetForTest();
     AppLog.httpClient = MockClient((_) async => http.Response('{}', 200));
   });
+
+  tearDown(() => messenger.setMockMethodCallHandler(_androidIdChannel, null));
 
   Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
 
@@ -113,21 +124,55 @@ void main() {
   });
 
   group('reconcileBindState', () {
-    test('сервер bound:true, локально не привязан → выставляет phone_verified', () async {
+    test('сервер bound:true, локально не привязан → выставляет phone_verified, номер, маску, и возвращает true', () async {
       PushService.httpClient = MockClient((_) async => http.Response(
-            jsonEncode({'bound': true, 'push_enabled': true, 'user_id': 'srv-user', 'phone_mask': '+7•••95'}),
+            jsonEncode({
+              'bound': true,
+              'push_enabled': true,
+              'user_id': 'srv-user',
+              'phone': '+79995550095',
+              'phone_mask': '+7xxx95',
+            }),
             200,
           ));
-      await PushService.reconcileBindState();
+      final restored = await PushService.reconcileBindState();
+      expect(restored, isTrue);
       final p = await SharedPreferences.getInstance();
       expect(p.getBool('phone_verified'), isTrue);
       expect(p.getString('verified_user_id'), 'srv-user');
+      expect(p.getString('verified_phone'), '+79995550095');
+      expect(p.getString('verified_phone_mask'), '+7xxx95');
     });
 
-    test('сервер bound:false НЕ снимает уже стоящий флаг', () async {
+    test('сервер bound:true, но локально уже привязан → маску обновляет, возвращает false', () async {
+      SharedPreferences.setMockInitialValues({'phone_verified': true, 'verified_user_id': 'keep'});
+      PushService.httpClient = MockClient((_) async => http.Response(
+            jsonEncode({'bound': true, 'user_id': 'keep', 'phone_mask': '+7xxx42'}),
+            200,
+          ));
+      final restored = await PushService.reconcileBindState();
+      expect(restored, isFalse);
+      final p = await SharedPreferences.getInstance();
+      expect(p.getString('verified_phone_mask'), '+7xxx42');
+    });
+
+    test('сервер bound:true, но user_id пуст (пуши без привязки) → НЕ включает, возвращает false', () async {
+      PushService.httpClient = MockClient((_) async => http.Response(
+            jsonEncode({'bound': true, 'user_id': '', 'push_enabled': false}),
+            200,
+          ));
+      final restored = await PushService.reconcileBindState();
+      expect(restored, isFalse);
+      final p = await SharedPreferences.getInstance();
+      expect(p.getBool('phone_verified'), isNot(isTrue));
+      expect(p.getString('verified_user_id'), isNull);
+    });
+
+    test('сервер bound:false НЕ снимает уже стоящий флаг, возвращает false', () async {
       SharedPreferences.setMockInitialValues({'phone_verified': true, 'verified_user_id': 'keep'});
       PushService.httpClient = MockClient((_) async => http.Response(jsonEncode({'bound': false}), 200));
-      await PushService.reconcileBindState();
+      final restored = await PushService.reconcileBindState();
+      expect(restored, isFalse);
       final p = await SharedPreferences.getInstance();
       expect(p.getBool('phone_verified'), isTrue);
       expect(p.getString('verified_user_id'), 'keep');
@@ -162,6 +207,29 @@ void main() {
       await PushService.debugSendAck('msg-1', 'foreground');
       await PushService.debugSendAck('msg-1', 'foreground');
       expect(count, 1);
+    });
+
+    test('POST не прошёл → ack остаётся в очереди и уходит при следующем flushPendingAcks', () async {
+      var ok = false;
+      var posts = 0;
+      PushService.httpClient = MockClient((_) async {
+        posts++;
+        return ok ? http.Response('{"status":"ok"}', 200) : http.Response('down', 503);
+      });
+
+      await PushService.debugSendAck('msg-x', 'background'); // 503 → в очередь
+      final p = await SharedPreferences.getInstance();
+      expect(p.getStringList('pending_acks'), isNotEmpty);
+      expect(p.getStringList('acked_msg_ids') ?? const [], isNot(contains('msg-x')));
+
+      ok = true;
+      await PushService.flushPendingAcks(); // сеть вернулась
+      expect(p.getStringList('pending_acks'), isEmpty);
+      expect(p.getStringList('acked_msg_ids'), contains('msg-x'));
+
+      final before = posts;
+      await PushService.flushPendingAcks(); // больше не шлём
+      expect(posts, before);
     });
   });
 

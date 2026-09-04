@@ -63,4 +63,18 @@ void main() {
     const done = '+7 (999) 123-45-67';
     expect(out(done, done), done);
   });
+
+  group('formatRuPhone (показ сохранённого номера)', () {
+    test('+7… / 7… / 8… / 10 цифр → +7 (999) 123-45-67', () {
+      expect(formatRuPhone('+79991234567'), '+7 (999) 123-45-67');
+      expect(formatRuPhone('79991234567'), '+7 (999) 123-45-67');
+      expect(formatRuPhone('89991234567'), '+7 (999) 123-45-67');
+      expect(formatRuPhone('9991234567'), '+7 (999) 123-45-67');
+    });
+    test('неполный номер / серверная маска → возвращает как есть', () {
+      expect(formatRuPhone('+7•••95'), '+7•••95');
+      expect(formatRuPhone('+7999'), '+7999');
+      expect(formatRuPhone(''), '');
+    });
+  });
 }
