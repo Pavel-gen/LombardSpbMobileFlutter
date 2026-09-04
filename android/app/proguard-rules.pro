@@ -1,5 +1,6 @@
-# Правила R8/ProGuard. Сейчас минификация ВЫКЛЮЧЕНА (см. build.gradle.kts).
-# Этот файл — заготовка на момент включения (`isMinifyEnabled = true`) в 2.0.1+.
+# Правила R8/ProGuard. Минификация ВКЛЮЧЕНА (build.gradle.kts: isMinifyEnabled,
+# isShrinkResources). ОБЯЗАТЕЛЬНО проверять release-сборку на устройстве:
+# холодный старт + пуш на убитом приложении + фоновый воркер.
 
 # --- Flutter ---
 # io.flutter.** держит сам Flutter Gradle Plugin автоматически.
@@ -14,6 +15,10 @@
 
 # --- flutter_local_notifications ---
 -keep class com.dexterous.** { *; }
+
+# --- smart_auth (SMS User Consent API) ---
+-keep class fman.ge.smart_auth.** { *; }
+-dontwarn fman.ge.smart_auth.**
 
 # --- workmanager (фоновый воркер) ---
 -keep class dev.fluttercommunity.workmanager.** { *; }

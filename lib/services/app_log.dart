@@ -57,25 +57,36 @@ class AppLog {
 
   /// Вызывать один раз при старте (до основной инициализации).
   static Future<void> init() async {
+    await _ensureIds();
     try {
-      final p = await SharedPreferences.getInstance();
-      _installId = p.getString(_kInstallId) ?? '';
-      if (_installId.isEmpty) {
-        _installId = _randomId();
-        await p.setString(_kInstallId, _installId);
-      }
-      _sessionId = _randomId();
-      try {
-        _appVersion = (await PackageInfo.fromPlatform()).version;
-      } catch (_) {}
+      _appVersion = (await PackageInfo.fromPlatform()).version;
     } catch (_) {}
     await event('app_start', {'session': _sessionId});
     // на старте отправляем всё, что накопилось за прошлую сессию
     unawaited(flush(force: true));
   }
 
+  /// Гарантирует `install_id` (постоянный) и `session_id` (на процесс), НЕ
+  /// логируя `app_start`. Нужно headless-изолятам (фоновый воркер, обработчик
+  /// пуша), где `init()` не вызывается, но события всё равно шлются.
+  static Future<void> _ensureIds() async {
+    if (_installId.isNotEmpty && _sessionId.isNotEmpty) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      if (_installId.isEmpty) {
+        _installId = p.getString(_kInstallId) ?? '';
+        if (_installId.isEmpty) {
+          _installId = _randomId();
+          await p.setString(_kInstallId, _installId);
+        }
+      }
+      if (_sessionId.isEmpty) _sessionId = _randomId();
+    } catch (_) {}
+  }
+
   /// Записать событие. `data` — компактный map (обрежется до ~1.5 КБ в JSON).
   static Future<void> event(String name, [Map<String, dynamic>? data]) async {
+    if (_installId.isEmpty || _sessionId.isEmpty) await _ensureIds();
     final rec = <String, dynamic>{
       't': DateTime.now().toUtc().toIso8601String(),
       'e': name,

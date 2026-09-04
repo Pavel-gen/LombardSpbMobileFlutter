@@ -41,6 +41,12 @@
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_color"
             android:resource="@android:color/white" />
+        <!-- Канал по умолчанию для FCM. Пуши у нас data-only (уведомление строит
+             flutter_local_notifications в канал twa_push_channel), но метадата
+             нужна, чтобы FCM не создавал свой безымянный канал в крайних случаях. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="twa_push_channel" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

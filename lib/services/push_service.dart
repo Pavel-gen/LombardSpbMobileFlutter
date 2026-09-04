@@ -455,6 +455,11 @@ class PushService {
       await _reportDiagnostics(await _collectDiagnostics(
           attempt: -1, error: e, stack: s, note: 'bg_worker'));
     }
+    // Сверить привязку с сервером и, если восстановилась (prefs стёрли, а
+    // приложение так и не открывали) — до-зарегистрировать токен уже с user_id.
+    if (await reconcileBindState()) {
+      await refreshServerRegistration();
+    }
     await syncInbox();
     await flushPendingAcks();
     await AppLog.flush(force: true);

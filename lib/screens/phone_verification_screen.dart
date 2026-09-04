@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -243,6 +244,10 @@ class _PhoneVerificationScreenState extends State<PhoneVerificationScreen> {
         await prefs.setString('verified_user_id', _currentUserId);
         await prefs.setString('verified_phone', _currentPhone);
         AppLog.event('verify_ok', {'user': _currentUserId});
+        // Сразу перерегистрируем FCM-токен на сервере — теперь с user_id.
+        // Иначе строка токена осталась бы без владельца до перезапуска
+        // приложения, и первые пуши ушли бы в SMS (сервер не нашёл бы токен).
+        unawaited(PushService.refreshServerRegistration());
         if (mounted) Navigator.of(context).pop(true);
       } else {
         AppLog.event('verify_fail', {'msg': json['message']});
